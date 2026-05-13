@@ -102,3 +102,9 @@ python experiments/speaker_separation/run_span_eval.py \
 
 For a quick smoke test, add `--limit 2`. To include a speech text prompt in
 addition to the span, use `--prompt-mode text-span`.
+
+The evaluator writes each completed sample immediately. Every sample directory
+contains the mixture, both ground-truth sources, the two direct reconstructions,
+and the two residual-derived reconstructions. The top-level `index.html` is
+refreshed after every sample and links to all listenable audio files with the
+main per-sample metrics.

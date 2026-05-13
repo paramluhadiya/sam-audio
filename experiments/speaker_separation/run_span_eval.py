@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import math
+import os
 import statistics
 from pathlib import Path
 from typing import Any
@@ -133,7 +135,25 @@ def flatten_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
 
 def save_audio(path: Path, wav: torch.Tensor, sample_rate: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(path), wav.detach().cpu().clamp(min=-1.0, max=1.0), sample_rate)
+    torchaudio.save(
+        str(path),
+        as_audio_2d(wav).clamp(min=-1.0, max=1.0),
+        sample_rate,
+    )
+
+
+def as_audio_2d(wav: torch.Tensor) -> torch.Tensor:
+    """Convert model/reference tensors into torchaudio's [channels, time] shape."""
+    wav = wav.detach().cpu().float().squeeze()
+    if wav.ndim == 0:
+        return wav.reshape(1, 1)
+    if wav.ndim == 1:
+        return wav.unsqueeze(0)
+    while wav.ndim > 2:
+        wav = wav[0]
+    if wav.size(0) > wav.size(1):
+        wav = wav.transpose(0, 1)
+    return wav.contiguous()
 
 
 def choose_description(record: dict[str, Any], args: argparse.Namespace) -> str:
@@ -187,6 +207,173 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
     return summary
 
 
+def fmt_db(value: float) -> str:
+    if not math.isfinite(value):
+        return "nan"
+    return f"{value:.2f} dB"
+
+
+def metric_cell(record: dict[str, Any], prefix: str, metric: str) -> str:
+    return html.escape(fmt_db(float(record[f"{prefix}_{metric}"])))
+
+
+def write_html_report(
+    output_dir: Path,
+    result_rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> None:
+    cards: list[str] = []
+    for record in result_rows:
+        mixture_id = html.escape(str(record["mixture_id"]))
+        cards.append(
+            f"""
+<section>
+  <h2>{mixture_id}</h2>
+  <p>
+    Speakers: {html.escape(str(record["speaker1_id"]))} and {html.escape(str(record["speaker2_id"]))}.
+    Direct overlap SI-SDR mean: {html.escape(fmt_db(float(record["direct_overlap_si_sdr_mean"])))}.
+    Residual overlap SI-SDR mean: {html.escape(fmt_db(float(record["residual_overlap_si_sdr_mean"])))}.
+    Residual minus direct: {html.escape(fmt_db(float(record["residual_minus_direct_overlap_si_sdr"])))}.
+  </p>
+  <div class="audio-grid">
+    <div><h3>Mixture</h3><audio controls src="{mixture_id}/mix.wav"></audio></div>
+    <div><h3>Source 1 Ground Truth</h3><audio controls src="{mixture_id}/source1_ref.wav"></audio></div>
+    <div><h3>Source 1 Direct</h3><audio controls src="{mixture_id}/pred_source1.wav"></audio></div>
+    <div><h3>Source 1 From Residual</h3><audio controls src="{mixture_id}/source1_from_residual.wav"></audio></div>
+    <div><h3>Source 2 Ground Truth</h3><audio controls src="{mixture_id}/source2_ref.wav"></audio></div>
+    <div><h3>Source 2 Direct</h3><audio controls src="{mixture_id}/pred_source2.wav"></audio></div>
+    <div><h3>Source 2 From Residual</h3><audio controls src="{mixture_id}/source2_from_residual.wav"></audio></div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Reconstruction</th>
+        <th>Full SI-SDR</th>
+        <th>Full SNR</th>
+        <th>Overlap SI-SDR</th>
+        <th>Overlap SNR</th>
+        <th>Overlap SI-SDR Improvement</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Source 1 direct</td>
+        <td>{metric_cell(record, "speaker1_direct", "si_sdr")}</td>
+        <td>{metric_cell(record, "speaker1_direct", "snr")}</td>
+        <td>{metric_cell(record, "speaker1_direct", "overlap_si_sdr")}</td>
+        <td>{metric_cell(record, "speaker1_direct", "overlap_snr")}</td>
+        <td>{metric_cell(record, "speaker1_direct", "overlap_si_sdr_improvement")}</td>
+      </tr>
+      <tr>
+        <td>Source 1 from residual</td>
+        <td>{metric_cell(record, "speaker1_residual", "si_sdr")}</td>
+        <td>{metric_cell(record, "speaker1_residual", "snr")}</td>
+        <td>{metric_cell(record, "speaker1_residual", "overlap_si_sdr")}</td>
+        <td>{metric_cell(record, "speaker1_residual", "overlap_snr")}</td>
+        <td>{metric_cell(record, "speaker1_residual", "overlap_si_sdr_improvement")}</td>
+      </tr>
+      <tr>
+        <td>Source 2 direct</td>
+        <td>{metric_cell(record, "speaker2_direct", "si_sdr")}</td>
+        <td>{metric_cell(record, "speaker2_direct", "snr")}</td>
+        <td>{metric_cell(record, "speaker2_direct", "overlap_si_sdr")}</td>
+        <td>{metric_cell(record, "speaker2_direct", "overlap_snr")}</td>
+        <td>{metric_cell(record, "speaker2_direct", "overlap_si_sdr_improvement")}</td>
+      </tr>
+      <tr>
+        <td>Source 2 from residual</td>
+        <td>{metric_cell(record, "speaker2_residual", "si_sdr")}</td>
+        <td>{metric_cell(record, "speaker2_residual", "snr")}</td>
+        <td>{metric_cell(record, "speaker2_residual", "overlap_si_sdr")}</td>
+        <td>{metric_cell(record, "speaker2_residual", "overlap_snr")}</td>
+        <td>{metric_cell(record, "speaker2_residual", "overlap_si_sdr_improvement")}</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+"""
+        )
+
+    summary_metrics = summary["metrics"]
+    direct_mean = summary_metrics["direct_overlap_si_sdr_mean"]["mean"]
+    residual_mean = summary_metrics["residual_overlap_si_sdr_mean"]["mean"]
+    delta_mean = summary_metrics["residual_minus_direct_overlap_si_sdr"]["mean"]
+    body = "\n".join(cards)
+    report = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SAM Audio Speaker Separation Evaluation</title>
+  <style>
+    body {{
+      color: #141414;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 32px;
+      max-width: 1180px;
+    }}
+    h1, h2, h3 {{ margin: 0 0 8px; }}
+    h1 {{ font-size: 24px; }}
+    h2 {{ font-size: 18px; margin-top: 28px; }}
+    h3 {{ font-size: 13px; }}
+    p {{ margin: 0 0 14px; }}
+    section {{ border-top: 1px solid #d8d8d8; padding-top: 20px; }}
+    audio {{ width: 100%; }}
+    table {{ border-collapse: collapse; margin-top: 16px; width: 100%; }}
+    th, td {{ border: 1px solid #d8d8d8; padding: 6px 8px; text-align: left; }}
+    th {{ background: #f3f3f3; }}
+    .audio-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    }}
+  </style>
+</head>
+<body>
+  <h1>SAM Audio Speaker Separation Evaluation</h1>
+  <p>
+    Examples: {summary["num_examples"]}.
+    Direct overlap SI-SDR mean: {html.escape(fmt_db(float(direct_mean)))}.
+    Residual overlap SI-SDR mean: {html.escape(fmt_db(float(residual_mean)))}.
+    Residual minus direct mean: {html.escape(fmt_db(float(delta_mean)))}.
+  </p>
+  <p>
+    Full metrics are in <a href="summary.json">summary.json</a> and
+    <a href="results.jsonl">results.jsonl</a>.
+  </p>
+  {body}
+</body>
+</html>
+"""
+    (output_dir / "index.html").write_text(report)
+
+
+def build_summary(
+    args: argparse.Namespace,
+    sample_rate: int,
+    result_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "manifest": str(args.manifest),
+        "checkpoint_path": args.checkpoint_path,
+        "num_examples": len(result_rows),
+        "sample_rate": sample_rate,
+        "prompt_mode": args.prompt_mode,
+        "candidates": args.candidates,
+        "metrics": summarize(result_rows),
+    }
+
+
+def write_summary_artifacts(
+    output_dir: Path,
+    args: argparse.Namespace,
+    sample_rate: int,
+    result_rows: list[dict[str, Any]],
+) -> None:
+    summary = build_summary(args, sample_rate, result_rows)
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    write_html_report(output_dir, result_rows, summary)
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -237,8 +424,21 @@ def main() -> None:
             ref2 = load_audio(record["source2_path"], sample_rate)
             mix = load_audio(record["mix_path"], sample_rate)
 
+            save_audio(mixture_output_dir / "mix.wav", mix, sample_rate)
+            save_audio(mixture_output_dir / "source1_ref.wav", ref1, sample_rate)
+            save_audio(mixture_output_dir / "source2_ref.wav", ref2, sample_rate)
             save_audio(mixture_output_dir / "pred_source1.wav", pred1, sample_rate)
             save_audio(mixture_output_dir / "pred_source2.wav", pred2, sample_rate)
+            save_audio(
+                mixture_output_dir / "source1_from_residual.wav",
+                residual2,
+                sample_rate,
+            )
+            save_audio(
+                mixture_output_dir / "source2_from_residual.wav",
+                residual1,
+                sample_rate,
+            )
             if args.save_residuals:
                 save_audio(
                     mixture_output_dir / "residual_from_source1_prompt.wav",
@@ -316,6 +516,8 @@ def main() -> None:
             result_rows.append(result_record)
             out.write(json.dumps(result_record) + "\n")
             out.flush()
+            os.fsync(out.fileno())
+            write_summary_artifacts(args.output_dir, args, sample_rate, result_rows)
 
             print(
                 f"[{index + 1}/{len(rows)}] {mixture_id}: "
@@ -324,19 +526,13 @@ def main() -> None:
                 f"residual-direct={residual_overlap - direct_overlap:+.2f} dB"
             )
 
-    summary = {
-        "manifest": str(args.manifest),
-        "checkpoint_path": args.checkpoint_path,
-        "num_examples": len(result_rows),
-        "sample_rate": sample_rate,
-        "prompt_mode": args.prompt_mode,
-        "candidates": args.candidates,
-        "metrics": summarize(result_rows),
-    }
+    summary = build_summary(args, sample_rate, result_rows)
     summary_path = args.output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    write_html_report(args.output_dir, result_rows, summary)
     print(f"Wrote per-example results to {results_jsonl}")
     print(f"Wrote summary to {summary_path}")
+    print(f"Wrote listenable report to {args.output_dir / 'index.html'}")
 
 
 if __name__ == "__main__":
