@@ -1,0 +1,14 @@
+# Install this after `pip install .` on the RunPod image used for SAM Audio
+# speaker separation experiments.
+#
+# TorchCodec is tightly coupled to the PyTorch ABI. The 0.5 wheel exposes
+# torchcodec.decoders.AudioDecoder and matches the PyTorch 2.7 series.
+torch==2.7.1
+torchaudio==2.7.1
+torchvision==0.22.1
+torchcodec==0.5
+xformers==0.0.31.post1
+
+# SAM Audio's current dependency metadata allows newer transformers releases,
+# but the pod setup has been verified with 4.54.0.
+transformers==4.54.0

@@ -50,6 +50,21 @@ tar --no-same-owner -xzf /workspace/data/libri-light/librispeech_finetuning.tgz 
   -C /tmp/sam-audio/data/libri-light
 ```
 
+## Pod Environment Setup
+
+Install SAM Audio first, then apply the pod-specific compatibility pins:
+
+```bash
+cd /tmp/sam-audio/repo
+pip install .
+apt-get update && apt-get install -y ffmpeg
+pip install --upgrade -r experiments/speaker_separation/requirements-pod.txt
+```
+
+The extra requirements file pins a PyTorch/TorchCodec pair that imports cleanly
+on the H100 pod. This matters because TorchCodec loads compiled libraries
+against PyTorch's ABI, and SAM Audio imports `torchcodec.decoders.AudioDecoder`.
+
 ## Build Mixtures
 
 Run this on the pod so the manifest contains pod-local absolute paths:
