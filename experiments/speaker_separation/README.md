@@ -210,6 +210,37 @@ and span predictor, and fine-tunes the flow transformer plus the small prompt
 conditioning adapters. Use `--train-all` only for a deliberately larger
 fine-tuning run.
 
+For a lower-variance adaptation run, train only the final DiT blocks and final
+DiT readout:
+
+```bash
+python experiments/speaker_separation/train_span_separator.py \
+  --manifest /workspace/experiments/speaker-separation/train-small-v1/train_manifest.jsonl \
+  --checkpoint-path /workspace/hf-cache/models--facebook--sam-audio-large/snapshots/5f2cd3a9471a08c7282c06036be6893e18de8b70 \
+  --output-dir /workspace/experiments/speaker-separation/train-small-v3-upper4-lr1e-6/checkpoints \
+  --device cuda \
+  --epochs 10 \
+  --batch-size 1 \
+  --grad-accum-steps 16 \
+  --learning-rate 1e-6 \
+  --trainable-scope upper-transformer \
+  --train-upper-layers 4 \
+  --save-every-steps 1000 \
+  --log-every-steps 10 \
+  --eval-manifest /workspace/experiments/speaker-separation/eval-filtered-v1/manifest.jsonl \
+  --eval-output-dir /workspace/experiments/speaker-separation/train-small-v3-upper4-lr1e-6/eval \
+  --eval-every-steps 500 \
+  --eval-limit 32 \
+  --eval-save-audio-examples 2 \
+  --eval-audio-examples 1 \
+  --eval-at-start \
+  --wandb-project voice-separation \
+  --wandb-run-name small-v3-upper4-lr1e-6
+```
+
+The trainer writes `trainable_params.json` into the checkpoint directory so the
+exact unfrozen tensors and parameter count are auditable.
+
 Checkpoints save trainable weights only by default and keep the last two
 `step_*` directories, with `latest` pointing to the newest checkpoint. Add
 `--save-optimizer` if optimizer-state resume is worth the extra disk, and

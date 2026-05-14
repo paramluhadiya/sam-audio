@@ -103,6 +103,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--wandb-mode", default="online")
+    parser.add_argument(
+        "--trainable-scope",
+        choices=("flow-and-adapters", "upper-transformer", "all"),
+        default="flow-and-adapters",
+        help=(
+            "Parameter subset to train. `flow-and-adapters` is the original "
+            "setting; `upper-transformer` trains only the last DiT blocks plus "
+            "the final DiT readout; `all` trains every parameter."
+        ),
+    )
+    parser.add_argument(
+        "--train-upper-layers",
+        type=int,
+        default=4,
+        help="Number of final DiT blocks to unfreeze with --trainable-scope upper-transformer.",
+    )
     parser.add_argument("--eval-manifest", type=Path, default=None)
     parser.add_argument("--eval-output-dir", type=Path, default=None)
     parser.add_argument("--eval-every-steps", type=int, default=0)
@@ -128,7 +144,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-all",
         action="store_true",
-        help="Fine-tune every SAM Audio parameter. By default only the flow model and prompt adapters train.",
+        help="Deprecated alias for --trainable-scope all.",
     )
     parser.add_argument(
         "--dtype",
@@ -139,22 +155,85 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_trainable(model: SAMAudio, train_all: bool) -> None:
-    if train_all:
+def set_module_trainable(module: torch.nn.Module, trainable: bool = True) -> None:
+    for parameter in module.parameters():
+        parameter.requires_grad = trainable
+
+
+def set_trainable(model: SAMAudio, args: argparse.Namespace) -> dict[str, Any]:
+    scope = "all" if args.train_all else args.trainable_scope
+
+    if scope == "all":
         for parameter in model.parameters():
             parameter.requires_grad = True
-        return
+        return trainable_summary(model, scope, [])
 
     for parameter in model.parameters():
         parameter.requires_grad = False
-    for module in (
-        model.transformer,
-        model.proj,
-        model.embed_anchors,
-        model.memory_proj,
-    ):
-        for parameter in module.parameters():
-            parameter.requires_grad = True
+    trainable_groups: list[str] = []
+
+    if scope == "flow-and-adapters":
+        for name, module in (
+            ("transformer", model.transformer),
+            ("proj", model.proj),
+            ("embed_anchors", model.embed_anchors),
+            ("memory_proj", model.memory_proj),
+        ):
+            set_module_trainable(module)
+            trainable_groups.append(name)
+    elif scope == "upper-transformer":
+        layers = model.transformer.layers
+        if args.train_upper_layers <= 0:
+            raise ValueError("--train-upper-layers must be positive")
+        if args.train_upper_layers > len(layers):
+            raise ValueError(
+                f"--train-upper-layers={args.train_upper_layers} exceeds "
+                f"transformer depth {len(layers)}"
+            )
+        first_trainable_layer = len(layers) - args.train_upper_layers
+        for index in range(first_trainable_layer, len(layers)):
+            set_module_trainable(layers[index])
+            trainable_groups.append(f"transformer.layers.{index}")
+        set_module_trainable(model.transformer.norm)
+        set_module_trainable(model.transformer.output)
+        model.transformer.final_layer_scale_shift_table.requires_grad = True
+        trainable_groups.extend(
+            (
+                "transformer.norm",
+                "transformer.output",
+                "transformer.final_layer_scale_shift_table",
+            )
+        )
+    else:
+        raise ValueError(f"Unknown trainable scope: {scope}")
+
+    return trainable_summary(model, scope, trainable_groups)
+
+
+def trainable_summary(
+    model: SAMAudio,
+    scope: str,
+    trainable_groups: list[str],
+) -> dict[str, Any]:
+    total_parameters = 0
+    trainable_parameters = 0
+    trainable_tensors: list[str] = []
+    for name, parameter in model.named_parameters():
+        count = parameter.numel()
+        total_parameters += count
+        if parameter.requires_grad:
+            trainable_parameters += count
+            trainable_tensors.append(name)
+
+    return {
+        "trainable_scope": scope,
+        "trainable_groups": trainable_groups,
+        "total_parameters": total_parameters,
+        "trainable_parameters": trainable_parameters,
+        "trainable_fraction": trainable_parameters / max(total_parameters, 1),
+        "trainable_tensor_count": len(trainable_tensors),
+        "trainable_tensors": trainable_tensors,
+    }
 
 
 def set_frozen_modules_eval(model: SAMAudio) -> None:
@@ -910,7 +989,17 @@ def train() -> None:
     )
     processor = SAMAudioProcessor.from_pretrained(args.checkpoint_path)
     model = model.to(device)
-    set_trainable(model, args.train_all)
+    trainable_info = set_trainable(model, args)
+    (args.output_dir / "trainable_params.json").write_text(
+        json.dumps(trainable_info, indent=2) + "\n"
+    )
+    print(
+        "trainable parameters: "
+        f"{trainable_info['trainable_parameters']:,} / "
+        f"{trainable_info['total_parameters']:,} "
+        f"({100.0 * trainable_info['trainable_fraction']:.2f}%)"
+    )
+    print(f"trainable scope: {trainable_info['trainable_scope']}")
     model.train()
     set_frozen_modules_eval(model)
 
