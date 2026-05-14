@@ -109,6 +109,22 @@ and the two residual-derived reconstructions. The top-level `index.html` is
 refreshed after every sample and links to all listenable audio files with the
 main per-sample metrics.
 
+For training-time evals, prefer a held-out manifest whose front and end anchor
+spans have both been checked for speech activity:
+
+```bash
+python experiments/speaker_separation/build_filtered_eval_mixtures.py \
+  --source-dir /tmp/sam-audio/data/libri-light-small \
+  --output-dir /workspace/experiments/speaker-separation/eval-filtered-v1 \
+  --num-mixtures 64 \
+  --clip-duration 10.0 \
+  --prompt-duration 1.0 \
+  --sample-rate 48000 \
+  --anchor-min-rms-dbfs -45 \
+  --anchor-min-peak-dbfs -55 \
+  --seed 113
+```
+
 ## Post-Training Data
 
 For the first post-training run, use the official Libri-Light `small.tar` split
@@ -129,7 +145,7 @@ Build a filtered training manifest from the extracted audio:
 python experiments/speaker_separation/build_training_manifest.py \
   --source-dir /tmp/sam-audio/data/libri-light-small \
   --output-dir /workspace/experiments/speaker-separation/train-small-v1 \
-  --num-examples 50000 \
+  --num-examples 5000 \
   --clip-duration 10.0 \
   --prompt-duration 1.0 \
   --sample-rate 48000 \
@@ -165,18 +181,20 @@ endpoint. There is no extra mixture-consistency loss in this first version.
 python experiments/speaker_separation/train_span_separator.py \
   --manifest /workspace/experiments/speaker-separation/train-small-v1/train_manifest.jsonl \
   --checkpoint-path /workspace/hf-cache/models--facebook--sam-audio-large/snapshots/5f2cd3a9471a08c7282c06036be6893e18de8b70 \
-  --output-dir /workspace/experiments/speaker-separation/train-small-v1/checkpoints \
+  --output-dir /workspace/experiments/speaker-separation/train-small-v2/checkpoints \
   --device cuda \
+  --epochs 10 \
   --batch-size 1 \
   --grad-accum-steps 16 \
   --learning-rate 1e-5 \
   --save-every-steps 1000 \
   --log-every-steps 10 \
-  --eval-manifest /workspace/experiments/speaker-separation/mixtures/manifest.jsonl \
-  --eval-output-dir /workspace/experiments/speaker-separation/train-small-v1/eval \
-  --eval-every-steps 100 \
-  --eval-limit 4 \
-  --eval-audio-examples 2 \
+  --eval-manifest /workspace/experiments/speaker-separation/eval-filtered-v1/manifest.jsonl \
+  --eval-output-dir /workspace/experiments/speaker-separation/train-small-v2/eval \
+  --eval-every-steps 500 \
+  --eval-limit 32 \
+  --eval-save-audio-examples 2 \
+  --eval-audio-examples 1 \
   --eval-at-start
 ```
 
@@ -198,15 +216,21 @@ Checkpoints save trainable weights only by default and keep the last two
 `--save-full-model` only if you explicitly want a standalone full-model state.
 
 When `--eval-manifest` is supplied, training periodically runs the same
-two-prompt held-out separation evaluation used by `run_span_eval.py`. Each eval
-step writes:
+two-prompt held-out separation evaluation used by `run_span_eval.py`, but labels
+the training-time results by anchor position. Each eval step writes:
 
-- `results.jsonl` with per-mixture SI-SDR/SNR metrics for direct selection and
-  residual-derived reconstructions.
+- `results.jsonl` with per-mixture SI-SDR/SNR metrics split into
+  `front_anchor_*` and `end_anchor_*` direct/residual reconstructions.
 - `summary.json` with aggregate means/medians/min/max values.
-- `index.html` with mixture, ground-truth, direct, and residual WAV players.
+- `index.html` with mixture, ground-truth, direct, and residual WAV players for
+  only the first `--eval-save-audio-examples` rows.
 - A top-level eval `index.html` timeline and `latest` symlink.
 - Wandb scalar metrics and audio panels when `--wandb-project` is set.
+
+Training loss logging is averaged over the full gradient-accumulation window,
+not the last microbatch. The trainer logs aggregate `train/loss` plus
+`train/front_anchor/*` and `train/end_anchor/*` losses so front-prompt and
+end-prompt behavior can be diagnosed separately.
 
 Omit `--wandb-project` for a local-only run that writes only `train_log.jsonl`
 checkpoints, eval JSON, and eval WAV/HTML artifacts.

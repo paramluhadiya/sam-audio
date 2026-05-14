@@ -23,7 +23,6 @@ from run_span_eval import (
     run_one_prompt,
     save_audio,
     summarize,
-    write_html_report,
 )
 from training_data import build_training_tensors
 
@@ -49,6 +48,7 @@ class SpanSeparationDataset(Dataset):
             "target": target,
             "residual": residual,
             "anchor": tuple(record["anchor"]),
+            "target_source": int(record["target_source"]),
             "description": record.get("description", ""),
             "example_id": record["example_id"],
         }
@@ -60,6 +60,9 @@ def collate_examples(examples: list[dict[str, Any]]) -> dict[str, Any]:
         "targets": torch.stack([example["target"] for example in examples]),
         "residuals": torch.stack([example["residual"] for example in examples]),
         "anchors": [[example["anchor"]] for example in examples],
+        "target_sources": torch.tensor(
+            [example["target_source"] for example in examples], dtype=torch.long
+        ),
         "descriptions": [example["description"] for example in examples],
         "example_ids": [example["example_id"] for example in examples],
     }
@@ -106,6 +109,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-limit", type=int, default=4)
     parser.add_argument("--eval-candidates", type=int, default=1)
     parser.add_argument("--eval-audio-examples", type=int, default=2)
+    parser.add_argument(
+        "--eval-save-audio-examples",
+        type=int,
+        default=4,
+        help="Save local WAV/HTML audio panels for this many eval rows. Metrics still use --eval-limit rows.",
+    )
     parser.add_argument(
         "--eval-at-start",
         action="store_true",
@@ -214,22 +223,31 @@ def masked_stream_losses(
     valid_mask: torch.Tensor,
     target_weight: float,
     residual_weight: float,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, float], dict[str, torch.Tensor]]:
     channels = pred_velocity.size(-1) // 2
     mask = valid_mask.unsqueeze(-1).to(pred_velocity.dtype)
-    denom = (mask.sum() * channels).clamp_min(1.0)
+    per_sample_denom = (mask.sum(dim=(1, 2)) * channels).clamp_min(1.0)
 
-    target_loss = (
+    target_square = (
         (pred_velocity[..., :channels] - true_velocity[..., :channels]).square() * mask
-    ).sum() / denom
-    residual_loss = (
+    )
+    residual_square = (
         (pred_velocity[..., channels:] - true_velocity[..., channels:]).square() * mask
-    ).sum() / denom
-    loss = target_weight * target_loss + residual_weight * residual_loss
+    )
+    target_per_sample = target_square.sum(dim=(1, 2)) / per_sample_denom
+    residual_per_sample = residual_square.sum(dim=(1, 2)) / per_sample_denom
+    loss_per_sample = target_weight * target_per_sample + residual_weight * residual_per_sample
+    target_loss = target_per_sample.mean()
+    residual_loss = residual_per_sample.mean()
+    loss = loss_per_sample.mean()
     return loss, {
         "target_loss": float(target_loss.detach().cpu()),
         "residual_loss": float(residual_loss.detach().cpu()),
         "loss": float(loss.detach().cpu()),
+    }, {
+        "target_loss": target_per_sample.detach(),
+        "residual_loss": residual_per_sample.detach(),
+        "loss": loss_per_sample.detach(),
     }
 
 
@@ -305,6 +323,59 @@ def load_checkpoint(
     return int(checkpoint["step"])
 
 
+def new_accum_stats() -> dict[str, Any]:
+    return {
+        "all": {"count": 0, "loss": 0.0, "target_loss": 0.0, "residual_loss": 0.0},
+        "front_anchor": {
+            "count": 0,
+            "loss": 0.0,
+            "target_loss": 0.0,
+            "residual_loss": 0.0,
+        },
+        "end_anchor": {
+            "count": 0,
+            "loss": 0.0,
+            "target_loss": 0.0,
+            "residual_loss": 0.0,
+        },
+    }
+
+
+def add_accum_stats(
+    stats: dict[str, Any],
+    per_sample_losses: dict[str, torch.Tensor],
+    target_sources: torch.Tensor,
+) -> None:
+    target_sources = target_sources.detach().cpu()
+    per_sample_cpu = {
+        name: values.detach().float().cpu() for name, values in per_sample_losses.items()
+    }
+    for index, source in enumerate(target_sources.tolist()):
+        side = "front_anchor" if int(source) == 1 else "end_anchor"
+        for bucket_name in ("all", side):
+            bucket = stats[bucket_name]
+            bucket["count"] += 1
+            for metric_name, values in per_sample_cpu.items():
+                bucket[metric_name] += float(values[index])
+
+
+def finalize_accum_stats(stats: dict[str, Any]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for bucket_name, bucket in stats.items():
+        count = int(bucket["count"])
+        metrics[f"{bucket_name}_count"] = float(count)
+        if count == 0:
+            continue
+        prefix = "train" if bucket_name == "all" else f"train/{bucket_name}"
+        for metric_name in ("loss", "target_loss", "residual_loss"):
+            metrics[f"{prefix}/{metric_name}"] = float(bucket[metric_name]) / count
+    if "train/loss" in metrics:
+        metrics["loss"] = metrics["train/loss"]
+        metrics["target_loss"] = metrics["train/target_loss"]
+        metrics["residual_loss"] = metrics["train/residual_loss"]
+    return metrics
+
+
 def build_eval_summary(
     args: argparse.Namespace,
     step: int,
@@ -323,6 +394,120 @@ def build_eval_summary(
     }
 
 
+def format_db(value: Any) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return "n/a"
+    return f"{float(value):.2f} dB"
+
+
+def mean_metric(summary: dict[str, Any], name: str) -> float | None:
+    value = summary.get("metrics", {}).get(name, {}).get("mean")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def write_training_eval_report(
+    output_dir: Path,
+    result_rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> None:
+    saved_rows = [record for record in result_rows if record.get("audio_saved")]
+    cards: list[str] = []
+    for record in saved_rows:
+        mixture_id = html.escape(str(record["mixture_id"]))
+        cards.append(
+            f"""
+<section>
+  <h2>{mixture_id}</h2>
+  <p>
+    Front direct overlap SI-SDR: {html.escape(format_db(record["front_anchor_direct_overlap_si_sdr"]))}.
+    End direct overlap SI-SDR: {html.escape(format_db(record["end_anchor_direct_overlap_si_sdr"]))}.
+  </p>
+  <div class="audio-grid">
+    <div><h3>Mixture</h3><audio controls src="{mixture_id}/mix.wav"></audio></div>
+    <div><h3>Front Target Ref (Source 1)</h3><audio controls src="{mixture_id}/front_anchor/target_ref_source1.wav"></audio></div>
+    <div><h3>Front Target Pred (Source 1)</h3><audio controls src="{mixture_id}/front_anchor/target_pred_source1.wav"></audio></div>
+    <div><h3>Front Residual Ref (Source 2)</h3><audio controls src="{mixture_id}/front_anchor/residual_ref_source2.wav"></audio></div>
+    <div><h3>Front Residual Pred (Source 2)</h3><audio controls src="{mixture_id}/front_anchor/residual_pred_source2.wav"></audio></div>
+    <div><h3>End Target Ref (Source 2)</h3><audio controls src="{mixture_id}/end_anchor/target_ref_source2.wav"></audio></div>
+    <div><h3>End Target Pred (Source 2)</h3><audio controls src="{mixture_id}/end_anchor/target_pred_source2.wav"></audio></div>
+    <div><h3>End Residual Ref (Source 1)</h3><audio controls src="{mixture_id}/end_anchor/residual_ref_source1.wav"></audio></div>
+    <div><h3>End Residual Pred (Source 1)</h3><audio controls src="{mixture_id}/end_anchor/residual_pred_source1.wav"></audio></div>
+  </div>
+</section>
+"""
+        )
+
+    rows: list[str] = []
+    for record in result_rows:
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(record['mixture_id']))}</td>"
+            f"<td>{html.escape(format_db(record['front_anchor_direct_overlap_si_sdr']))}</td>"
+            f"<td>{html.escape(format_db(record['end_anchor_direct_overlap_si_sdr']))}</td>"
+            f"<td>{html.escape(format_db(record['front_anchor_residual_overlap_si_sdr']))}</td>"
+            f"<td>{html.escape(format_db(record['end_anchor_residual_overlap_si_sdr']))}</td>"
+            "</tr>"
+        )
+
+    report = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SAM Audio Training Separation Eval</title>
+  <style>
+    body {{
+      color: #141414;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 32px;
+      max-width: 1180px;
+    }}
+    h1, h2, h3 {{ margin: 0 0 8px; }}
+    h1 {{ font-size: 24px; }}
+    h2 {{ font-size: 18px; margin-top: 28px; }}
+    h3 {{ font-size: 13px; }}
+    p {{ margin: 0 0 14px; }}
+    section {{ border-top: 1px solid #d8d8d8; padding-top: 20px; }}
+    audio {{ width: 100%; }}
+    table {{ border-collapse: collapse; margin: 18px 0 24px; width: 100%; }}
+    th, td {{ border: 1px solid #d8d8d8; padding: 6px 8px; text-align: left; }}
+    th {{ background: #f3f3f3; }}
+    .audio-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    }}
+  </style>
+</head>
+<body>
+  <h1>SAM Audio Training Separation Eval</h1>
+  <p>
+    Examples: {summary["num_examples"]}.
+    Front direct overlap SI-SDR: {html.escape(format_db(mean_metric(summary, "front_anchor_direct_overlap_si_sdr")))}.
+    End direct overlap SI-SDR: {html.escape(format_db(mean_metric(summary, "end_anchor_direct_overlap_si_sdr")))}.
+    Front residual overlap SI-SDR: {html.escape(format_db(mean_metric(summary, "front_anchor_residual_overlap_si_sdr")))}.
+    End residual overlap SI-SDR: {html.escape(format_db(mean_metric(summary, "end_anchor_residual_overlap_si_sdr")))}.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Mixture</th>
+        <th>Front Direct</th>
+        <th>End Direct</th>
+        <th>Front Residual</th>
+        <th>End Residual</th>
+      </tr>
+    </thead>
+    <tbody>
+      {"".join(rows)}
+    </tbody>
+  </table>
+  {"".join(cards)}
+</body>
+</html>
+"""
+    (output_dir / "index.html").write_text(report)
+
+
 def save_eval_summary(
     args: argparse.Namespace,
     step_dir: Path,
@@ -332,7 +517,7 @@ def save_eval_summary(
 ) -> dict[str, Any]:
     summary = build_eval_summary(args, step, sample_rate, result_rows)
     (step_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    write_html_report(step_dir, result_rows, summary)
+    write_training_eval_report(step_dir, result_rows, summary)
     return summary
 
 
@@ -360,23 +545,27 @@ def write_eval_root_index(output_root: Path) -> None:
         try:
             summary = json.loads(summary_path.read_text())
             metrics = summary.get("metrics", {})
-            direct = metrics.get("direct_overlap_si_sdr_mean", {}).get("mean")
-            residual = metrics.get("residual_overlap_si_sdr_mean", {}).get("mean")
-            delta = metrics.get("residual_minus_direct_overlap_si_sdr", {}).get("mean")
+            front_direct = metrics.get("front_anchor_direct_overlap_si_sdr", {}).get("mean")
+            end_direct = metrics.get("end_anchor_direct_overlap_si_sdr", {}).get("mean")
+            front_residual = metrics.get(
+                "front_anchor_residual_overlap_si_sdr", {}
+            ).get("mean")
+            end_residual = metrics.get("end_anchor_residual_overlap_si_sdr", {}).get(
+                "mean"
+            )
         except (OSError, json.JSONDecodeError):
-            direct = residual = delta = None
-        metric_cells = []
-        for value in (direct, residual, delta):
-            if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                metric_cells.append(f"{float(value):.2f} dB")
-            else:
-                metric_cells.append("n/a")
+            front_direct = end_direct = front_residual = end_residual = None
+        metric_cells = [
+            format_db(value)
+            for value in (front_direct, end_direct, front_residual, end_residual)
+        ]
         step_name = html.escape(step_dir.name)
         rows.append(
             f"<tr><td><a href=\"{step_name}/index.html\">{step_name}</a></td>"
             f"<td>{html.escape(metric_cells[0])}</td>"
             f"<td>{html.escape(metric_cells[1])}</td>"
-            f"<td>{html.escape(metric_cells[2])}</td></tr>"
+            f"<td>{html.escape(metric_cells[2])}</td>"
+            f"<td>{html.escape(metric_cells[3])}</td></tr>"
         )
 
     body = "\n".join(rows)
@@ -406,9 +595,10 @@ def write_eval_root_index(output_root: Path) -> None:
     <thead>
       <tr>
         <th>Step</th>
-        <th>Direct Overlap SI-SDR</th>
-        <th>Residual Overlap SI-SDR</th>
-        <th>Residual Minus Direct</th>
+        <th>Front Direct</th>
+        <th>End Direct</th>
+        <th>Front Residual</th>
+        <th>End Residual</th>
       </tr>
     </thead>
     <tbody>
@@ -460,14 +650,24 @@ def log_eval_to_wandb(
     audio_payload: dict[str, Any] = {}
     audio_files = (
         ("mix", "mix.wav"),
-        ("source1_ref", "source1_ref.wav"),
-        ("source1_direct", "pred_source1.wav"),
-        ("source1_residual", "source1_from_residual.wav"),
-        ("source2_ref", "source2_ref.wav"),
-        ("source2_direct", "pred_source2.wav"),
-        ("source2_residual", "source2_from_residual.wav"),
+        ("front_anchor/target_ref_source1", "front_anchor/target_ref_source1.wav"),
+        ("front_anchor/target_pred_source1", "front_anchor/target_pred_source1.wav"),
+        (
+            "front_anchor/residual_ref_source2",
+            "front_anchor/residual_ref_source2.wav",
+        ),
+        (
+            "front_anchor/residual_pred_source2",
+            "front_anchor/residual_pred_source2.wav",
+        ),
+        ("end_anchor/target_ref_source2", "end_anchor/target_ref_source2.wav"),
+        ("end_anchor/target_pred_source2", "end_anchor/target_pred_source2.wav"),
+        ("end_anchor/residual_ref_source1", "end_anchor/residual_ref_source1.wav"),
+        ("end_anchor/residual_pred_source1", "end_anchor/residual_pred_source1.wav"),
     )
     for record in result_rows[:audio_examples]:
+        if not record.get("audio_saved"):
+            continue
         mixture_id = str(record["mixture_id"])
         sample_dir = step_dir / mixture_id
         for label, filename in audio_files:
@@ -510,6 +710,7 @@ def run_training_eval(
             for index, record in enumerate(rows):
                 mixture_id = record["mixture_id"]
                 mixture_output_dir = step_dir / mixture_id
+                save_example_audio = index < args.eval_save_audio_examples
                 pred1, residual1 = run_one_prompt(
                     model=model,
                     processor=processor,
@@ -533,64 +734,92 @@ def run_training_eval(
                 ref2 = load_audio(record["source2_path"], sample_rate)
                 mix = load_audio(record["mix_path"], sample_rate)
 
-                save_audio(mixture_output_dir / "mix.wav", mix, sample_rate)
-                save_audio(mixture_output_dir / "source1_ref.wav", ref1, sample_rate)
-                save_audio(mixture_output_dir / "source2_ref.wav", ref2, sample_rate)
-                save_audio(mixture_output_dir / "pred_source1.wav", pred1, sample_rate)
-                save_audio(mixture_output_dir / "pred_source2.wav", pred2, sample_rate)
-                save_audio(
-                    mixture_output_dir / "source1_from_residual.wav",
-                    residual2,
-                    sample_rate,
-                )
-                save_audio(
-                    mixture_output_dir / "source2_from_residual.wav",
-                    residual1,
-                    sample_rate,
-                )
-                if args.eval_save_residuals:
+                if save_example_audio:
+                    save_audio(mixture_output_dir / "mix.wav", mix, sample_rate)
                     save_audio(
-                        mixture_output_dir / "residual_from_source1_prompt.wav",
+                        mixture_output_dir / "front_anchor/target_ref_source1.wav",
+                        ref1,
+                        sample_rate,
+                    )
+                    save_audio(
+                        mixture_output_dir / "front_anchor/target_pred_source1.wav",
+                        pred1,
+                        sample_rate,
+                    )
+                    save_audio(
+                        mixture_output_dir / "front_anchor/residual_ref_source2.wav",
+                        ref2,
+                        sample_rate,
+                    )
+                    save_audio(
+                        mixture_output_dir / "front_anchor/residual_pred_source2.wav",
                         residual1,
                         sample_rate,
                     )
                     save_audio(
-                        mixture_output_dir / "residual_from_source2_prompt.wav",
+                        mixture_output_dir / "end_anchor/target_ref_source2.wav",
+                        ref2,
+                        sample_rate,
+                    )
+                    save_audio(
+                        mixture_output_dir / "end_anchor/target_pred_source2.wav",
+                        pred2,
+                        sample_rate,
+                    )
+                    save_audio(
+                        mixture_output_dir / "end_anchor/residual_ref_source1.wav",
+                        ref1,
+                        sample_rate,
+                    )
+                    save_audio(
+                        mixture_output_dir / "end_anchor/residual_pred_source1.wav",
                         residual2,
                         sample_rate,
                     )
+                    if args.eval_save_residuals:
+                        save_audio(
+                            mixture_output_dir
+                            / "front_anchor/raw_residual_from_front_prompt.wav",
+                            residual1,
+                            sample_rate,
+                        )
+                        save_audio(
+                            mixture_output_dir / "end_anchor/raw_residual_from_end_prompt.wav",
+                            residual2,
+                            sample_rate,
+                        )
 
                 overlap_start = float(record["overlap_start"])
                 overlap_end = float(record["overlap_end"])
-                speaker1_direct = metric_block(
+                front_anchor_direct = metric_block(
                     pred1, ref1, mix, sample_rate, overlap_start, overlap_end
                 )
-                speaker2_direct = metric_block(
+                end_anchor_direct = metric_block(
                     pred2, ref2, mix, sample_rate, overlap_start, overlap_end
                 )
-                speaker1_from_residual = metric_block(
+                end_anchor_residual = metric_block(
                     residual2, ref1, mix, sample_rate, overlap_start, overlap_end
                 )
-                speaker2_from_residual = metric_block(
+                front_anchor_residual = metric_block(
                     residual1, ref2, mix, sample_rate, overlap_start, overlap_end
                 )
-                direct_swapped_source1 = metric_block(
+                front_direct_swapped = metric_block(
                     pred1, ref2, mix, sample_rate, overlap_start, overlap_end
                 )
-                direct_swapped_source2 = metric_block(
+                end_direct_swapped = metric_block(
                     pred2, ref1, mix, sample_rate, overlap_start, overlap_end
                 )
                 direct_overlap = (
-                    speaker1_direct["overlap_si_sdr"]
-                    + speaker2_direct["overlap_si_sdr"]
+                    front_anchor_direct["overlap_si_sdr"]
+                    + end_anchor_direct["overlap_si_sdr"]
                 ) / 2.0
                 swapped_overlap = (
-                    direct_swapped_source1["overlap_si_sdr"]
-                    + direct_swapped_source2["overlap_si_sdr"]
+                    front_direct_swapped["overlap_si_sdr"]
+                    + end_direct_swapped["overlap_si_sdr"]
                 ) / 2.0
                 residual_overlap = (
-                    speaker1_from_residual["overlap_si_sdr"]
-                    + speaker2_from_residual["overlap_si_sdr"]
+                    end_anchor_residual["overlap_si_sdr"]
+                    + front_anchor_residual["overlap_si_sdr"]
                 ) / 2.0
 
                 result_record: dict[str, Any] = {
@@ -599,6 +828,7 @@ def run_training_eval(
                     "speaker1_id": record["speaker1_id"],
                     "speaker2_id": record["speaker2_id"],
                     "prompt_mode": "span",
+                    "audio_saved": save_example_audio,
                     "direct_overlap_si_sdr_mean": direct_overlap,
                     "residual_overlap_si_sdr_mean": residual_overlap,
                     "swapped_overlap_si_sdr_mean": swapped_overlap,
@@ -607,22 +837,25 @@ def run_training_eval(
                     - direct_overlap,
                 }
                 for metric_name in ("si_sdr", "snr", "overlap_si_sdr", "overlap_snr"):
-                    result_record[f"speaker1_residual_minus_direct_{metric_name}"] = (
-                        speaker1_from_residual[metric_name]
-                        - speaker1_direct[metric_name]
+                    result_record[f"front_anchor_residual_minus_direct_{metric_name}"] = (
+                        front_anchor_residual[metric_name]
+                        - front_anchor_direct[metric_name]
                     )
-                    result_record[f"speaker2_residual_minus_direct_{metric_name}"] = (
-                        speaker2_from_residual[metric_name]
-                        - speaker2_direct[metric_name]
+                    result_record[f"end_anchor_residual_minus_direct_{metric_name}"] = (
+                        end_anchor_residual[metric_name] - end_anchor_direct[metric_name]
                     )
 
-                result_record.update(flatten_metrics("speaker1_direct", speaker1_direct))
-                result_record.update(flatten_metrics("speaker2_direct", speaker2_direct))
                 result_record.update(
-                    flatten_metrics("speaker1_residual", speaker1_from_residual)
+                    flatten_metrics("front_anchor_direct", front_anchor_direct)
                 )
                 result_record.update(
-                    flatten_metrics("speaker2_residual", speaker2_from_residual)
+                    flatten_metrics("front_anchor_residual", front_anchor_residual)
+                )
+                result_record.update(
+                    flatten_metrics("end_anchor_direct", end_anchor_direct)
+                )
+                result_record.update(
+                    flatten_metrics("end_anchor_residual", end_anchor_residual)
                 )
                 result_rows.append(result_record)
                 out.write(json.dumps(result_record) + "\n")
@@ -632,8 +865,10 @@ def run_training_eval(
 
                 print(
                     f"eval step {step} [{index + 1}/{len(rows)}] {mixture_id}: "
-                    f"direct overlap SI-SDR={direct_overlap:.2f} dB, "
-                    f"residual overlap SI-SDR={residual_overlap:.2f} dB"
+                    f"front direct={front_anchor_direct['overlap_si_sdr']:.2f} dB, "
+                    f"end direct={end_anchor_direct['overlap_si_sdr']:.2f} dB, "
+                    f"front residual={front_anchor_residual['overlap_si_sdr']:.2f} dB, "
+                    f"end residual={end_anchor_residual['overlap_si_sdr']:.2f} dB"
                 )
     finally:
         if was_training:
@@ -705,6 +940,8 @@ def train() -> None:
     optimizer.zero_grad(set_to_none=True)
     log_path = args.output_dir / "train_log.jsonl"
     shutil.copy2(args.manifest, args.output_dir / "train_manifest.jsonl")
+    accum_stats = new_accum_stats()
+    accum_microbatches = 0
     last_eval_step: int | None = None
     if args.eval_at_start and args.eval_manifest is not None:
         run_training_eval(args, model, processor, device, step, wandb_run)
@@ -720,6 +957,7 @@ def train() -> None:
                 ).to(device)
                 targets = batch_data["targets"].to(device, non_blocking=True)
                 residuals = batch_data["residuals"].to(device, non_blocking=True)
+                target_sources = batch_data["target_sources"]
 
                 with torch.autocast(
                     device_type=device.type,
@@ -740,7 +978,7 @@ def train() -> None:
                         time=time,
                         **forward_args,
                     )
-                    loss, loss_values = masked_stream_losses(
+                    loss, loss_values, per_sample_losses = masked_stream_losses(
                         pred_velocity=pred_velocity,
                         true_velocity=true_velocity,
                         valid_mask=forward_args["audio_pad_mask"],
@@ -750,42 +988,68 @@ def train() -> None:
                     scaled_loss = loss / args.grad_accum_steps
 
                 scaled_loss.backward()
-                if (batch_index + 1) % args.grad_accum_steps != 0:
+                add_accum_stats(accum_stats, per_sample_losses, target_sources)
+                accum_microbatches += 1
+                if accum_microbatches < args.grad_accum_steps:
                     continue
 
                 if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        trainable_params, args.max_grad_norm
+                    )
+                    grad_norm_value = float(grad_norm.detach().cpu())
+                else:
+                    grad_norm_value = math.nan
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
+                accum_values = finalize_accum_stats(accum_stats)
+                accum_stats = new_accum_stats()
+                accum_microbatches = 0
 
                 log_record = {
                     "step": step,
                     "epoch": epoch,
                     "batch_index": batch_index,
                     "lr": optimizer.param_groups[0]["lr"],
-                    **loss_values,
+                    "grad_norm": grad_norm_value,
+                    "last_microbatch_loss": loss_values["loss"],
+                    "last_microbatch_target_loss": loss_values["target_loss"],
+                    "last_microbatch_residual_loss": loss_values["residual_loss"],
+                    **accum_values,
                 }
                 log_file.write(json.dumps(log_record) + "\n")
                 log_file.flush()
                 if wandb_run is not None:
-                    wandb_run.log(
+                    wandb_payload = {
+                        key: value
+                        for key, value in accum_values.items()
+                        if key.startswith("train/")
+                    }
+                    wandb_payload.update(
                         {
-                            "train/loss": loss_values["loss"],
-                            "train/target_loss": loss_values["target_loss"],
-                            "train/residual_loss": loss_values["residual_loss"],
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                             "train/batch_index": batch_index,
-                        },
-                        step=step,
+                            "train/grad_norm": grad_norm_value,
+                            "train/last_microbatch_loss": loss_values["loss"],
+                            "train/front_anchor_count": accum_values.get(
+                                "front_anchor_count", 0.0
+                            ),
+                            "train/end_anchor_count": accum_values.get(
+                                "end_anchor_count", 0.0
+                            ),
+                        }
                     )
+                    wandb_run.log(wandb_payload, step=step)
 
                 if step % args.log_every_steps == 0:
                     print(
-                        f"step {step}: loss={loss_values['loss']:.4f}, "
-                        f"target={loss_values['target_loss']:.4f}, "
-                        f"residual={loss_values['residual_loss']:.4f}"
+                        f"step {step}: loss={accum_values['loss']:.4f}, "
+                        f"target={accum_values['target_loss']:.4f}, "
+                        f"residual={accum_values['residual_loss']:.4f}, "
+                        f"front={accum_values.get('train/front_anchor/loss', math.nan):.4f}, "
+                        f"end={accum_values.get('train/end_anchor/loss', math.nan):.4f}"
                     )
                 if step % args.save_every_steps == 0:
                     save_checkpoint(args.output_dir, step, model, optimizer, args)
