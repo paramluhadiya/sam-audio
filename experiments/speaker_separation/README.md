@@ -133,9 +133,8 @@ python experiments/speaker_separation/build_training_manifest.py \
   --clip-duration 10.0 \
   --prompt-duration 1.0 \
   --sample-rate 48000 \
-  --anchor-min-rms-dbfs -35 \
-  --anchor-min-peak-dbfs -25 \
-  --max-overlap-rms-delta-db 8 \
+  --anchor-min-rms-dbfs -45 \
+  --anchor-min-peak-dbfs -55 \
   --seed 13
 ```
 
@@ -143,6 +142,10 @@ The training manifest is lightweight: it stores source paths, source offsets,
 speaker IDs, the chosen target side, the span anchor, filter stats, and
 normalization/headroom settings. It does not precompute every mixture WAV.
 The builder also writes a small `previews/` directory for spot checks.
+By default it filters only the selected conditioning anchor, rejecting examples
+where that one-second prompt is effectively silent. Add
+`--max-overlap-rms-delta-db` for an optional overlap balance filter, or
+`--require-both-anchors` to require both solo anchors to pass.
 
 ## Post-Training
 

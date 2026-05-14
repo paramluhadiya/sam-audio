@@ -15,6 +15,7 @@ from training_data import (
     choose_segment_offset,
     group_by_speaker,
     layout_sources,
+    load_segment,
     peak_dbfs,
     rms_dbfs,
     scan_sources,
@@ -33,14 +34,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-rate", type=int, default=48_000)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--rms-dbfs", type=float, default=-23.0)
-    parser.add_argument("--anchor-min-rms-dbfs", type=float, default=-35.0)
-    parser.add_argument("--anchor-min-peak-dbfs", type=float, default=-25.0)
+    parser.add_argument("--anchor-min-rms-dbfs", type=float, default=-45.0)
+    parser.add_argument("--anchor-min-peak-dbfs", type=float, default=-55.0)
     parser.add_argument(
         "--require-both-anchors",
         action="store_true",
         help="Require source1 and source2 solo anchors to pass activity thresholds. Default checks only the chosen target anchor.",
     )
-    parser.add_argument("--max-overlap-rms-delta-db", type=float, default=8.0)
+    parser.add_argument(
+        "--max-overlap-rms-delta-db",
+        type=float,
+        default=None,
+        help="Optional overlap loudness-balance filter. Disabled by default.",
+    )
     parser.add_argument("--headroom", type=float, default=0.98)
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--description", default="")
@@ -106,13 +112,36 @@ def candidate_record(
     return record
 
 
+def load_anchor(record: dict[str, Any], source_index: int, args: argparse.Namespace):
+    prefix = f"source{source_index}"
+    source_sample_rate = int(record[f"{prefix}_sample_rate"])
+    frame_offset = int(record[f"{prefix}_frame_offset"])
+    if source_index == 2:
+        frame_offset += int(round((args.clip_duration - args.prompt_duration) * source_sample_rate))
+    return load_segment(
+        record[f"{prefix}_original_path"],
+        source_sample_rate,
+        frame_offset,
+        args.prompt_duration,
+        args.sample_rate,
+    )
+
+
 def add_filter_stats(record: dict[str, Any], args: argparse.Namespace) -> dict[str, float]:
+    stats: dict[str, float] = {}
+    sources = (1, 2) if args.require_both_anchors else (int(record["target_source"]),)
+    for source_index in sources:
+        anchor = load_anchor(record, source_index, args)
+        stats[f"source{source_index}_anchor_rms_dbfs"] = rms_dbfs(anchor)
+        stats[f"source{source_index}_anchor_peak_dbfs"] = peak_dbfs(anchor)
+
+    if args.max_overlap_rms_delta_db is None:
+        return stats
+
     wav1, wav2 = build_sources_from_record(record)
     prompt_frames = int(round(args.prompt_duration * args.sample_rate))
     clip_frames = int(round(args.clip_duration * args.sample_rate))
 
-    source1_anchor = wav1[:, :prompt_frames]
-    source2_anchor = wav2[:, clip_frames - prompt_frames : clip_frames]
     source1_overlap = wav1[:, prompt_frames:clip_frames]
     source2_overlap = wav2[:, : clip_frames - prompt_frames]
     mix, _, _, mix_peak, mix_gain = layout_sources(
@@ -125,17 +154,18 @@ def add_filter_stats(record: dict[str, Any], args: argparse.Namespace) -> dict[s
     )
     del mix
 
-    return {
-        "source1_anchor_rms_dbfs": rms_dbfs(source1_anchor),
-        "source1_anchor_peak_dbfs": peak_dbfs(source1_anchor),
-        "source2_anchor_rms_dbfs": rms_dbfs(source2_anchor),
-        "source2_anchor_peak_dbfs": peak_dbfs(source2_anchor),
-        "source1_overlap_rms_dbfs": rms_dbfs(source1_overlap),
-        "source2_overlap_rms_dbfs": rms_dbfs(source2_overlap),
-        "overlap_rms_delta_db": abs(rms_dbfs(source1_overlap) - rms_dbfs(source2_overlap)),
-        "mix_peak_pre_gain": mix_peak,
-        "mix_gain": mix_gain,
-    }
+    source1_overlap_rms = rms_dbfs(source1_overlap)
+    source2_overlap_rms = rms_dbfs(source2_overlap)
+    stats.update(
+        {
+            "source1_overlap_rms_dbfs": source1_overlap_rms,
+            "source2_overlap_rms_dbfs": source2_overlap_rms,
+            "overlap_rms_delta_db": abs(source1_overlap_rms - source2_overlap_rms),
+            "mix_peak_pre_gain": mix_peak,
+            "mix_gain": mix_gain,
+        }
+    )
+    return stats
 
 
 def rejection_reason(record: dict[str, Any], args: argparse.Namespace) -> str | None:
@@ -147,7 +177,10 @@ def rejection_reason(record: dict[str, Any], args: argparse.Namespace) -> str | 
             return f"{source}_anchor_rms"
         if record[f"{source}_anchor_peak_dbfs"] < args.anchor_min_peak_dbfs:
             return f"{source}_anchor_peak"
-    if record["overlap_rms_delta_db"] > args.max_overlap_rms_delta_db:
+    if (
+        args.max_overlap_rms_delta_db is not None
+        and record["overlap_rms_delta_db"] > args.max_overlap_rms_delta_db
+    ):
         return "overlap_balance"
     return None
 
