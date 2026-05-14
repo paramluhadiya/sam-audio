@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import math
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,16 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from sam_audio import SAMAudio, SAMAudioProcessor
+from run_span_eval import (
+    flatten_metrics,
+    load_audio,
+    metric_block,
+    read_manifest,
+    run_one_prompt,
+    save_audio,
+    summarize,
+    write_html_report,
+)
 from training_data import build_training_tensors
 
 
@@ -87,6 +100,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--wandb-mode", default="online")
+    parser.add_argument("--eval-manifest", type=Path, default=None)
+    parser.add_argument("--eval-output-dir", type=Path, default=None)
+    parser.add_argument("--eval-every-steps", type=int, default=0)
+    parser.add_argument("--eval-limit", type=int, default=4)
+    parser.add_argument("--eval-candidates", type=int, default=1)
+    parser.add_argument("--eval-audio-examples", type=int, default=2)
+    parser.add_argument(
+        "--eval-at-start",
+        action="store_true",
+        help="Run one held-out separation eval before the first optimizer step.",
+    )
+    parser.add_argument(
+        "--eval-save-residuals",
+        action="store_true",
+        help="Also save raw residual WAVs from each eval prompt.",
+    )
     parser.add_argument(
         "--train-all",
         action="store_true",
@@ -117,6 +146,12 @@ def set_trainable(model: SAMAudio, train_all: bool) -> None:
     ):
         for parameter in module.parameters():
             parameter.requires_grad = True
+
+
+def set_frozen_modules_eval(model: SAMAudio) -> None:
+    model.audio_codec.eval()
+    model.text_encoder.eval()
+    model.vision_encoder.eval()
 
 
 def serialize_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -270,6 +305,359 @@ def load_checkpoint(
     return int(checkpoint["step"])
 
 
+def build_eval_summary(
+    args: argparse.Namespace,
+    step: int,
+    sample_rate: int,
+    result_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "manifest": str(args.eval_manifest),
+        "checkpoint_path": args.checkpoint_path,
+        "step": step,
+        "num_examples": len(result_rows),
+        "sample_rate": sample_rate,
+        "prompt_mode": "span",
+        "candidates": args.eval_candidates,
+        "metrics": summarize(result_rows),
+    }
+
+
+def save_eval_summary(
+    args: argparse.Namespace,
+    step_dir: Path,
+    step: int,
+    sample_rate: int,
+    result_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary = build_eval_summary(args, step, sample_rate, result_rows)
+    (step_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    write_html_report(step_dir, result_rows, summary)
+    return summary
+
+
+def append_eval_log(output_dir: Path, step_dir: Path, summary: dict[str, Any]) -> None:
+    record: dict[str, Any] = {
+        "step": summary["step"],
+        "eval_dir": str(step_dir),
+        "num_examples": summary["num_examples"],
+    }
+    for name, values in summary["metrics"].items():
+        mean = values.get("mean")
+        if isinstance(mean, (int, float)) and math.isfinite(float(mean)):
+            record[f"{name}_mean"] = float(mean)
+    with (output_dir / "eval_log.jsonl").open("a") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+def write_eval_root_index(output_root: Path) -> None:
+    rows: list[str] = []
+    for step_dir in sorted(output_root.glob("step_*")):
+        summary_path = step_dir / "summary.json"
+        report_path = step_dir / "index.html"
+        if not summary_path.exists() or not report_path.exists():
+            continue
+        try:
+            summary = json.loads(summary_path.read_text())
+            metrics = summary.get("metrics", {})
+            direct = metrics.get("direct_overlap_si_sdr_mean", {}).get("mean")
+            residual = metrics.get("residual_overlap_si_sdr_mean", {}).get("mean")
+            delta = metrics.get("residual_minus_direct_overlap_si_sdr", {}).get("mean")
+        except (OSError, json.JSONDecodeError):
+            direct = residual = delta = None
+        metric_cells = []
+        for value in (direct, residual, delta):
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                metric_cells.append(f"{float(value):.2f} dB")
+            else:
+                metric_cells.append("n/a")
+        step_name = html.escape(step_dir.name)
+        rows.append(
+            f"<tr><td><a href=\"{step_name}/index.html\">{step_name}</a></td>"
+            f"<td>{html.escape(metric_cells[0])}</td>"
+            f"<td>{html.escape(metric_cells[1])}</td>"
+            f"<td>{html.escape(metric_cells[2])}</td></tr>"
+        )
+
+    body = "\n".join(rows)
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "index.html").write_text(
+        f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SAM Audio Training Eval Timeline</title>
+  <style>
+    body {{
+      color: #141414;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 32px;
+      max-width: 920px;
+    }}
+    h1 {{ font-size: 24px; margin: 0 0 16px; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #d8d8d8; padding: 6px 8px; text-align: left; }}
+    th {{ background: #f3f3f3; }}
+  </style>
+</head>
+<body>
+  <h1>SAM Audio Training Eval Timeline</h1>
+  <table>
+    <thead>
+      <tr>
+        <th>Step</th>
+        <th>Direct Overlap SI-SDR</th>
+        <th>Residual Overlap SI-SDR</th>
+        <th>Residual Minus Direct</th>
+      </tr>
+    </thead>
+    <tbody>
+      {body}
+    </tbody>
+  </table>
+</body>
+</html>
+"""
+    )
+
+
+def update_latest_eval(output_root: Path, step_dir: Path) -> None:
+    latest = output_root / "latest"
+    tmp_latest = output_root / "latest.tmp"
+    if tmp_latest.exists() or tmp_latest.is_symlink():
+        tmp_latest.unlink()
+    tmp_latest.symlink_to(step_dir.name, target_is_directory=True)
+    if latest.exists() or latest.is_symlink():
+        latest.unlink()
+    tmp_latest.rename(latest)
+    write_eval_root_index(output_root)
+
+
+def log_eval_to_wandb(
+    wandb_run: Any,
+    step: int,
+    step_dir: Path,
+    sample_rate: int,
+    result_rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+    audio_examples: int,
+) -> None:
+    if wandb_run is None:
+        return
+
+    scalar_payload: dict[str, float] = {"eval/num_examples": float(len(result_rows))}
+    for name, values in summary["metrics"].items():
+        mean = values.get("mean")
+        if isinstance(mean, (int, float)) and math.isfinite(float(mean)):
+            scalar_payload[f"eval/{name}"] = float(mean)
+    wandb_run.log(scalar_payload, step=step)
+
+    if audio_examples <= 0:
+        return
+
+    import wandb
+
+    audio_payload: dict[str, Any] = {}
+    audio_files = (
+        ("mix", "mix.wav"),
+        ("source1_ref", "source1_ref.wav"),
+        ("source1_direct", "pred_source1.wav"),
+        ("source1_residual", "source1_from_residual.wav"),
+        ("source2_ref", "source2_ref.wav"),
+        ("source2_direct", "pred_source2.wav"),
+        ("source2_residual", "source2_from_residual.wav"),
+    )
+    for record in result_rows[:audio_examples]:
+        mixture_id = str(record["mixture_id"])
+        sample_dir = step_dir / mixture_id
+        for label, filename in audio_files:
+            path = sample_dir / filename
+            if path.exists():
+                audio_payload[f"eval_audio/{mixture_id}/{label}"] = wandb.Audio(
+                    str(path),
+                    sample_rate=sample_rate,
+                    caption=f"step {step} {mixture_id} {label}",
+                )
+    if audio_payload:
+        wandb_run.log(audio_payload, step=step)
+
+
+def run_training_eval(
+    args: argparse.Namespace,
+    model: SAMAudio,
+    processor: SAMAudioProcessor,
+    device: torch.device,
+    step: int,
+    wandb_run: Any,
+) -> dict[str, Any] | None:
+    if args.eval_manifest is None:
+        return None
+
+    output_root = args.eval_output_dir or args.output_dir / "eval"
+    step_dir = output_root / f"step_{step:08d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    rows = read_manifest(args.eval_manifest, args.eval_limit)
+    if not rows:
+        raise RuntimeError(f"No eval rows found in {args.eval_manifest}")
+
+    sample_rate = processor.audio_sampling_rate
+    result_rows: list[dict[str, Any]] = []
+    results_jsonl = step_dir / "results.jsonl"
+    was_training = model.training
+    model.eval()
+    try:
+        with results_jsonl.open("w") as out:
+            for index, record in enumerate(rows):
+                mixture_id = record["mixture_id"]
+                mixture_output_dir = step_dir / mixture_id
+                pred1, residual1 = run_one_prompt(
+                    model=model,
+                    processor=processor,
+                    mix_path=record["mix_path"],
+                    description="",
+                    anchor=record["source1_anchor"],
+                    device=device,
+                    candidates=args.eval_candidates,
+                )
+                pred2, residual2 = run_one_prompt(
+                    model=model,
+                    processor=processor,
+                    mix_path=record["mix_path"],
+                    description="",
+                    anchor=record["source2_anchor"],
+                    device=device,
+                    candidates=args.eval_candidates,
+                )
+
+                ref1 = load_audio(record["source1_path"], sample_rate)
+                ref2 = load_audio(record["source2_path"], sample_rate)
+                mix = load_audio(record["mix_path"], sample_rate)
+
+                save_audio(mixture_output_dir / "mix.wav", mix, sample_rate)
+                save_audio(mixture_output_dir / "source1_ref.wav", ref1, sample_rate)
+                save_audio(mixture_output_dir / "source2_ref.wav", ref2, sample_rate)
+                save_audio(mixture_output_dir / "pred_source1.wav", pred1, sample_rate)
+                save_audio(mixture_output_dir / "pred_source2.wav", pred2, sample_rate)
+                save_audio(
+                    mixture_output_dir / "source1_from_residual.wav",
+                    residual2,
+                    sample_rate,
+                )
+                save_audio(
+                    mixture_output_dir / "source2_from_residual.wav",
+                    residual1,
+                    sample_rate,
+                )
+                if args.eval_save_residuals:
+                    save_audio(
+                        mixture_output_dir / "residual_from_source1_prompt.wav",
+                        residual1,
+                        sample_rate,
+                    )
+                    save_audio(
+                        mixture_output_dir / "residual_from_source2_prompt.wav",
+                        residual2,
+                        sample_rate,
+                    )
+
+                overlap_start = float(record["overlap_start"])
+                overlap_end = float(record["overlap_end"])
+                speaker1_direct = metric_block(
+                    pred1, ref1, mix, sample_rate, overlap_start, overlap_end
+                )
+                speaker2_direct = metric_block(
+                    pred2, ref2, mix, sample_rate, overlap_start, overlap_end
+                )
+                speaker1_from_residual = metric_block(
+                    residual2, ref1, mix, sample_rate, overlap_start, overlap_end
+                )
+                speaker2_from_residual = metric_block(
+                    residual1, ref2, mix, sample_rate, overlap_start, overlap_end
+                )
+                direct_swapped_source1 = metric_block(
+                    pred1, ref2, mix, sample_rate, overlap_start, overlap_end
+                )
+                direct_swapped_source2 = metric_block(
+                    pred2, ref1, mix, sample_rate, overlap_start, overlap_end
+                )
+                direct_overlap = (
+                    speaker1_direct["overlap_si_sdr"]
+                    + speaker2_direct["overlap_si_sdr"]
+                ) / 2.0
+                swapped_overlap = (
+                    direct_swapped_source1["overlap_si_sdr"]
+                    + direct_swapped_source2["overlap_si_sdr"]
+                ) / 2.0
+                residual_overlap = (
+                    speaker1_from_residual["overlap_si_sdr"]
+                    + speaker2_from_residual["overlap_si_sdr"]
+                ) / 2.0
+
+                result_record: dict[str, Any] = {
+                    "index": index,
+                    "mixture_id": mixture_id,
+                    "speaker1_id": record["speaker1_id"],
+                    "speaker2_id": record["speaker2_id"],
+                    "prompt_mode": "span",
+                    "direct_overlap_si_sdr_mean": direct_overlap,
+                    "residual_overlap_si_sdr_mean": residual_overlap,
+                    "swapped_overlap_si_sdr_mean": swapped_overlap,
+                    "assignment_correct": direct_overlap >= swapped_overlap,
+                    "residual_minus_direct_overlap_si_sdr": residual_overlap
+                    - direct_overlap,
+                }
+                for metric_name in ("si_sdr", "snr", "overlap_si_sdr", "overlap_snr"):
+                    result_record[f"speaker1_residual_minus_direct_{metric_name}"] = (
+                        speaker1_from_residual[metric_name]
+                        - speaker1_direct[metric_name]
+                    )
+                    result_record[f"speaker2_residual_minus_direct_{metric_name}"] = (
+                        speaker2_from_residual[metric_name]
+                        - speaker2_direct[metric_name]
+                    )
+
+                result_record.update(flatten_metrics("speaker1_direct", speaker1_direct))
+                result_record.update(flatten_metrics("speaker2_direct", speaker2_direct))
+                result_record.update(
+                    flatten_metrics("speaker1_residual", speaker1_from_residual)
+                )
+                result_record.update(
+                    flatten_metrics("speaker2_residual", speaker2_from_residual)
+                )
+                result_rows.append(result_record)
+                out.write(json.dumps(result_record) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+                save_eval_summary(args, step_dir, step, sample_rate, result_rows)
+
+                print(
+                    f"eval step {step} [{index + 1}/{len(rows)}] {mixture_id}: "
+                    f"direct overlap SI-SDR={direct_overlap:.2f} dB, "
+                    f"residual overlap SI-SDR={residual_overlap:.2f} dB"
+                )
+    finally:
+        if was_training:
+            model.train()
+            set_frozen_modules_eval(model)
+
+    summary = save_eval_summary(args, step_dir, step, sample_rate, result_rows)
+    update_latest_eval(output_root, step_dir)
+    append_eval_log(args.output_dir, step_dir, summary)
+    log_eval_to_wandb(
+        wandb_run=wandb_run,
+        step=step,
+        step_dir=step_dir,
+        sample_rate=sample_rate,
+        result_rows=result_rows,
+        summary=summary,
+        audio_examples=args.eval_audio_examples,
+    )
+    print(f"wrote eval step {step} report to {step_dir / 'index.html'}")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return summary
+
+
 def train() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -289,9 +677,7 @@ def train() -> None:
     model = model.to(device)
     set_trainable(model, args.train_all)
     model.train()
-    model.audio_codec.eval()
-    model.text_encoder.eval()
-    model.vision_encoder.eval()
+    set_frozen_modules_eval(model)
 
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -319,6 +705,10 @@ def train() -> None:
     optimizer.zero_grad(set_to_none=True)
     log_path = args.output_dir / "train_log.jsonl"
     shutil.copy2(args.manifest, args.output_dir / "train_manifest.jsonl")
+    last_eval_step: int | None = None
+    if args.eval_at_start and args.eval_manifest is not None:
+        run_training_eval(args, model, processor, device, step, wandb_run)
+        last_eval_step = step
 
     with log_path.open("a") as log_file:
         for epoch in range(args.epochs):
@@ -405,7 +795,18 @@ def train() -> None:
                             step=step,
                         )
                     print(f"saved checkpoint at step {step}")
+                if (
+                    args.eval_manifest is not None
+                    and args.eval_every_steps > 0
+                    and step % args.eval_every_steps == 0
+                ):
+                    run_training_eval(args, model, processor, device, step, wandb_run)
+                    last_eval_step = step
                 if args.max_steps is not None and step >= args.max_steps:
+                    if args.eval_manifest is not None and last_eval_step != step:
+                        run_training_eval(
+                            args, model, processor, device, step, wandb_run
+                        )
                     save_checkpoint(args.output_dir, step, model, optimizer, args)
                     if wandb_run is not None:
                         wandb_run.finish()
@@ -415,6 +816,8 @@ def train() -> None:
         raise RuntimeError("No optimizer steps were run")
     if step % args.save_every_steps != 0:
         save_checkpoint(args.output_dir, step, model, optimizer, args)
+    if args.eval_manifest is not None and last_eval_step != step:
+        run_training_eval(args, model, processor, device, step, wandb_run)
     if wandb_run is not None:
         wandb_run.finish()
 

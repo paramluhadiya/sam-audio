@@ -167,17 +167,23 @@ python experiments/speaker_separation/train_span_separator.py \
   --checkpoint-path /workspace/hf-cache/models--facebook--sam-audio-large/snapshots/5f2cd3a9471a08c7282c06036be6893e18de8b70 \
   --output-dir /workspace/experiments/speaker-separation/train-small-v1/checkpoints \
   --device cuda \
-  --batch-size 2 \
-  --grad-accum-steps 8 \
+  --batch-size 1 \
+  --grad-accum-steps 16 \
   --learning-rate 1e-5 \
-  --save-every-steps 100 \
-  --log-every-steps 10
+  --save-every-steps 1000 \
+  --log-every-steps 10 \
+  --eval-manifest /workspace/experiments/speaker-separation/mixtures/manifest.jsonl \
+  --eval-output-dir /workspace/experiments/speaker-separation/train-small-v1/eval \
+  --eval-every-steps 100 \
+  --eval-limit 4 \
+  --eval-audio-examples 2 \
+  --eval-at-start
 ```
 
 To enable wandb, export `WANDB_API_KEY` on the pod and add the tracking flags:
 
 ```bash
-  --wandb-project sam-audio-speaker-separation \
+  --wandb-project voice-separation \
   --wandb-run-name small-v1
 ```
 
@@ -191,5 +197,16 @@ Checkpoints save trainable weights only by default and keep the last two
 `--save-optimizer` if optimizer-state resume is worth the extra disk, and
 `--save-full-model` only if you explicitly want a standalone full-model state.
 
+When `--eval-manifest` is supplied, training periodically runs the same
+two-prompt held-out separation evaluation used by `run_span_eval.py`. Each eval
+step writes:
+
+- `results.jsonl` with per-mixture SI-SDR/SNR metrics for direct selection and
+  residual-derived reconstructions.
+- `summary.json` with aggregate means/medians/min/max values.
+- `index.html` with mixture, ground-truth, direct, and residual WAV players.
+- A top-level eval `index.html` timeline and `latest` symlink.
+- Wandb scalar metrics and audio panels when `--wandb-project` is set.
+
 Omit `--wandb-project` for a local-only run that writes only `train_log.jsonl`
-and checkpoints.
+checkpoints, eval JSON, and eval WAV/HTML artifacts.
