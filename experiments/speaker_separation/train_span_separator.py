@@ -70,6 +70,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--residual-loss-weight", type=float, default=1.0)
     parser.add_argument("--log-every-steps", type=int, default=10)
     parser.add_argument("--save-every-steps", type=int, default=100)
+    parser.add_argument("--keep-last-checkpoints", type=int, default=2)
+    parser.add_argument("--resume-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--save-full-model",
+        action="store_true",
+        help="Save every model parameter. Default saves only trainable parameters.",
+    )
+    parser.add_argument(
+        "--save-optimizer",
+        action="store_true",
+        help="Include optimizer state in checkpoints. This is large for full fine-tuning.",
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-entity", default=None)
@@ -186,6 +198,32 @@ def masked_stream_losses(
     }
 
 
+def checkpoint_model_state(model: SAMAudio, save_full_model: bool) -> dict[str, torch.Tensor]:
+    if save_full_model:
+        return {key: value.detach().cpu() for key, value in model.state_dict().items()}
+
+    trainable_names = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    return {
+        key: value.detach().cpu()
+        for key, value in model.state_dict().items()
+        if key in trainable_names
+    }
+
+
+def prune_checkpoints(output_dir: Path, keep_last: int) -> None:
+    if keep_last <= 0:
+        return
+    checkpoints = sorted(
+        path
+        for path in output_dir.glob("step_*")
+        if path.is_dir() and path.name.removeprefix("step_").isdigit()
+    )
+    for checkpoint_dir in checkpoints[:-keep_last]:
+        shutil.rmtree(checkpoint_dir)
+
+
 def save_checkpoint(
     output_dir: Path,
     step: int,
@@ -197,10 +235,12 @@ def save_checkpoint(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "step": step,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "checkpoint_type": "full_model" if args.save_full_model else "trainable_only",
+        "model": checkpoint_model_state(model, args.save_full_model),
         "args": serialize_args(args),
     }
+    if args.save_optimizer:
+        checkpoint["optimizer"] = optimizer.state_dict()
     torch.save(checkpoint, checkpoint_dir / "training_state.pt")
     latest = output_dir / "latest"
     tmp_latest = output_dir / "latest.tmp"
@@ -210,6 +250,24 @@ def save_checkpoint(
     if latest.exists() or latest.is_symlink():
         latest.unlink()
     tmp_latest.rename(latest)
+    prune_checkpoints(output_dir, args.keep_last_checkpoints)
+
+
+def load_checkpoint(
+    checkpoint_path: Path,
+    model: SAMAudio,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+    if unexpected:
+        raise RuntimeError(f"Unexpected checkpoint keys: {unexpected}")
+    skipped_missing = [name for name in missing if name not in checkpoint["model"]]
+    if checkpoint.get("checkpoint_type") == "full_model" and skipped_missing:
+        raise RuntimeError(f"Missing full-model checkpoint keys: {skipped_missing}")
+    if "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    return int(checkpoint["step"])
 
 
 def train() -> None:
@@ -241,6 +299,10 @@ def train() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+    step = 0
+    if args.resume_checkpoint is not None:
+        step = load_checkpoint(args.resume_checkpoint, model, optimizer)
+        print(f"resumed from {args.resume_checkpoint} at step {step}")
     dataset = SpanSeparationDataset(args.manifest)
     loader = DataLoader(
         dataset,
@@ -254,7 +316,6 @@ def train() -> None:
 
     autocast_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     use_autocast = device.type == "cuda" and args.dtype != "float32"
-    step = 0
     optimizer.zero_grad(set_to_none=True)
     log_path = args.output_dir / "train_log.jsonl"
     shutil.copy2(args.manifest, args.output_dir / "train_manifest.jsonl")

@@ -183,5 +183,10 @@ and span predictor, and fine-tunes the flow transformer plus the small prompt
 conditioning adapters. Use `--train-all` only for a deliberately larger
 fine-tuning run.
 
+Checkpoints save trainable weights only by default and keep the last two
+`step_*` directories, with `latest` pointing to the newest checkpoint. Add
+`--save-optimizer` if optimizer-state resume is worth the extra disk, and
+`--save-full-model` only if you explicitly want a standalone full-model state.
+
 Omit `--wandb-project` for a local-only run that writes only `train_log.jsonl`
 and checkpoints.
