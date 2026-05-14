@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rms-dbfs", type=float, default=-23.0)
     parser.add_argument("--anchor-min-rms-dbfs", type=float, default=-35.0)
     parser.add_argument("--anchor-min-peak-dbfs", type=float, default=-25.0)
+    parser.add_argument(
+        "--require-both-anchors",
+        action="store_true",
+        help="Require source1 and source2 solo anchors to pass activity thresholds. Default checks only the chosen target anchor.",
+    )
     parser.add_argument("--max-overlap-rms-delta-db", type=float, default=8.0)
     parser.add_argument("--headroom", type=float, default=0.98)
     parser.add_argument("--max-files", type=int, default=None)
@@ -134,7 +139,10 @@ def add_filter_stats(record: dict[str, Any], args: argparse.Namespace) -> dict[s
 
 
 def rejection_reason(record: dict[str, Any], args: argparse.Namespace) -> str | None:
-    for source in ("source1", "source2"):
+    sources = ("source1", "source2")
+    if not args.require_both_anchors:
+        sources = (f"source{record['target_source']}",)
+    for source in sources:
         if record[f"{source}_anchor_rms_dbfs"] < args.anchor_min_rms_dbfs:
             return f"{source}_anchor_rms"
         if record[f"{source}_anchor_peak_dbfs"] < args.anchor_min_peak_dbfs:
@@ -228,6 +236,7 @@ def main() -> None:
         "rms_dbfs": args.rms_dbfs,
         "anchor_min_rms_dbfs": args.anchor_min_rms_dbfs,
         "anchor_min_peak_dbfs": args.anchor_min_peak_dbfs,
+        "require_both_anchors": args.require_both_anchors,
         "max_overlap_rms_delta_db": args.max_overlap_rms_delta_db,
         "headroom": args.headroom,
     }

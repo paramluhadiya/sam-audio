@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ import torchaudio
 
 AUDIO_EXTENSIONS = {".flac", ".wav", ".mp3", ".ogg"}
 EPS = 1.0e-8
+LIBRI_LIGHT_SAMPLE_RATE = 16_000
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,10 @@ def scan_sources(
     min_duration: float,
     max_files: int | None = None,
 ) -> list[SourceClip]:
+    json_clips = scan_librilight_json_sources(source_dir, min_duration, max_files)
+    if json_clips:
+        return json_clips
+
     candidates = sorted(
         path
         for path in source_dir.rglob("*")
@@ -71,6 +77,59 @@ def scan_sources(
         if clip.duration >= min_duration:
             clips.append(clip)
     return clips
+
+
+def scan_librilight_json_sources(
+    source_dir: Path,
+    min_duration: float,
+    max_files: int | None = None,
+) -> list[SourceClip]:
+    json_paths = sorted(source_dir.rglob("*.json"))
+    if max_files is not None:
+        json_paths = json_paths[:max_files]
+
+    clips: list[SourceClip] = []
+    for json_path in json_paths:
+        audio_path = matching_audio_path(json_path)
+        if audio_path is None:
+            continue
+        try:
+            metadata = json.loads(json_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Skipping unreadable metadata {json_path}: {exc}")
+            continue
+
+        duration = metadata_duration(metadata)
+        if duration < min_duration:
+            continue
+        speaker_id = str(metadata.get("speaker") or infer_speaker_id(audio_path))
+        clips.append(
+            SourceClip(
+                path=audio_path,
+                speaker_id=speaker_id,
+                sample_rate=LIBRI_LIGHT_SAMPLE_RATE,
+                num_frames=int(math.ceil(duration * LIBRI_LIGHT_SAMPLE_RATE)),
+            )
+        )
+    return clips
+
+
+def matching_audio_path(json_path: Path) -> Path | None:
+    for suffix in AUDIO_EXTENSIONS:
+        candidate = json_path.with_suffix(suffix)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def metadata_duration(metadata: dict[str, Any]) -> float:
+    voice_activity = metadata.get("voice_activity") or []
+    if voice_activity:
+        return max(float(end) for _, end in voice_activity)
+    book_meta = metadata.get("book_meta") or {}
+    if "totaltimesecs" in book_meta:
+        return float(book_meta["totaltimesecs"])
+    return 0.0
 
 
 def group_by_speaker(clips: list[SourceClip]) -> dict[str, list[SourceClip]]:
