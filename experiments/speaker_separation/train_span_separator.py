@@ -103,6 +103,13 @@ def set_trainable(model: SAMAudio, train_all: bool) -> None:
             parameter.requires_grad = True
 
 
+def serialize_args(args: argparse.Namespace) -> dict[str, Any]:
+    serialized: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        serialized[key] = str(value) if isinstance(value, Path) else value
+    return serialized
+
+
 def encode_endpoint(
     model: SAMAudio,
     target: torch.Tensor,
@@ -169,7 +176,7 @@ def save_checkpoint(
         "step": step,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "args": vars(args),
+        "args": serialize_args(args),
     }
     torch.save(checkpoint, checkpoint_dir / "training_state.pt")
     latest = output_dir / "latest"
@@ -187,7 +194,9 @@ def train() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "args.json").write_text(json.dumps(vars(args), indent=2) + "\n")
+    (args.output_dir / "args.json").write_text(
+        json.dumps(serialize_args(args), indent=2) + "\n"
+    )
 
     model = SAMAudio.from_pretrained(
         args.checkpoint_path,
