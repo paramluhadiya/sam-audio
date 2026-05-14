@@ -171,7 +171,17 @@ python experiments/speaker_separation/train_span_separator.py \
   --log-every-steps 10
 ```
 
+To enable wandb, export `WANDB_API_KEY` on the pod and add the tracking flags:
+
+```bash
+  --wandb-project sam-audio-speaker-separation \
+  --wandb-run-name small-v1
+```
+
 By default the trainer freezes the codec, text encoder, vision encoder, rankers,
 and span predictor, and fine-tunes the flow transformer plus the small prompt
 conditioning adapters. Use `--train-all` only for a deliberately larger
 fine-tuning run.
+
+Omit `--wandb-project` for a local-only run that writes only `train_log.jsonl`
+and checkpoints.

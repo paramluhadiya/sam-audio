@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-steps", type=int, default=10)
     parser.add_argument("--save-every-steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--wandb-mode", default="online")
     parser.add_argument(
         "--train-all",
         action="store_true",
@@ -108,6 +112,25 @@ def serialize_args(args: argparse.Namespace) -> dict[str, Any]:
     for key, value in vars(args).items():
         serialized[key] = str(value) if isinstance(value, Path) else value
     return serialized
+
+
+def maybe_init_wandb(args: argparse.Namespace):
+    if args.wandb_project is None:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError(
+            "wandb logging was requested, but wandb is not installed. "
+            "Run `pip install wandb` or omit --wandb-project."
+        ) from exc
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        mode=args.wandb_mode,
+        config=serialize_args(args),
+    )
 
 
 def encode_endpoint(
@@ -197,6 +220,7 @@ def train() -> None:
     (args.output_dir / "args.json").write_text(
         json.dumps(serialize_args(args), indent=2) + "\n"
     )
+    wandb_run = maybe_init_wandb(args)
 
     model = SAMAudio.from_pretrained(
         args.checkpoint_path,
@@ -293,6 +317,18 @@ def train() -> None:
                 }
                 log_file.write(json.dumps(log_record) + "\n")
                 log_file.flush()
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "train/loss": loss_values["loss"],
+                            "train/target_loss": loss_values["target_loss"],
+                            "train/residual_loss": loss_values["residual_loss"],
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/epoch": epoch,
+                            "train/batch_index": batch_index,
+                        },
+                        step=step,
+                    )
 
                 if step % args.log_every_steps == 0:
                     print(
@@ -302,15 +338,24 @@ def train() -> None:
                     )
                 if step % args.save_every_steps == 0:
                     save_checkpoint(args.output_dir, step, model, optimizer, args)
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {"checkpoint/step": step, "checkpoint/saved": 1},
+                            step=step,
+                        )
                     print(f"saved checkpoint at step {step}")
                 if args.max_steps is not None and step >= args.max_steps:
                     save_checkpoint(args.output_dir, step, model, optimizer, args)
+                    if wandb_run is not None:
+                        wandb_run.finish()
                     return
 
     if step == 0:
         raise RuntimeError("No optimizer steps were run")
     if step % args.save_every_steps != 0:
         save_checkpoint(args.output_dir, step, model, optimizer, args)
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

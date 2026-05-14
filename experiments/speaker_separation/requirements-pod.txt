@@ -12,3 +12,6 @@ xformers==0.0.31.post1
 # SAM Audio's current dependency metadata allows newer transformers releases,
 # but the pod setup has been verified with 4.54.0.
 transformers==4.54.0
+
+# Optional experiment tracking for post-training runs.
+wandb>=0.22.0
