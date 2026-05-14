@@ -108,3 +108,70 @@ contains the mixture, both ground-truth sources, the two direct reconstructions,
 and the two residual-derived reconstructions. The top-level `index.html` is
 refreshed after every sample and links to all listenable audio files with the
 main per-sample metrics.
+
+## Post-Training Data
+
+For the first post-training run, use the official Libri-Light `small.tar` split
+instead of the 10 hour limited-supervision bundle:
+
+```bash
+mkdir -p /workspace/data/libri-light
+wget -c -O /workspace/data/libri-light/small.tar \
+  https://dl.fbaipublicfiles.com/librilight/data/small.tar
+mkdir -p /tmp/sam-audio/data/libri-light-small
+tar --no-same-owner -xf /workspace/data/libri-light/small.tar \
+  -C /tmp/sam-audio/data/libri-light-small
+```
+
+Build a filtered training manifest from the extracted audio:
+
+```bash
+python experiments/speaker_separation/build_training_manifest.py \
+  --source-dir /tmp/sam-audio/data/libri-light-small \
+  --output-dir /workspace/experiments/speaker-separation/train-small-v1 \
+  --num-examples 50000 \
+  --clip-duration 10.0 \
+  --prompt-duration 1.0 \
+  --sample-rate 48000 \
+  --anchor-min-rms-dbfs -35 \
+  --anchor-min-peak-dbfs -25 \
+  --max-overlap-rms-delta-db 8 \
+  --seed 13
+```
+
+The training manifest is lightweight: it stores source paths, source offsets,
+speaker IDs, the chosen target side, the span anchor, filter stats, and
+normalization/headroom settings. It does not precompute every mixture WAV.
+The builder also writes a small `previews/` directory for spot checks.
+
+## Post-Training
+
+The training objective samples examples where source 1 or source 2 has already
+been selected as the prompted target with probability 1/2 by the manifest
+builder. The flow endpoint is the concatenation of target-source codec latents
+and residual-source codec latents:
+
+```text
+x_1 = concat(codec(target_source), codec(residual_source))
+```
+
+The standard flow-matching velocity loss is applied to both halves of that
+endpoint. There is no extra mixture-consistency loss in this first version.
+
+```bash
+python experiments/speaker_separation/train_span_separator.py \
+  --manifest /workspace/experiments/speaker-separation/train-small-v1/train_manifest.jsonl \
+  --checkpoint-path /workspace/hf-cache/models--facebook--sam-audio-large/snapshots/5f2cd3a9471a08c7282c06036be6893e18de8b70 \
+  --output-dir /workspace/experiments/speaker-separation/train-small-v1/checkpoints \
+  --device cuda \
+  --batch-size 2 \
+  --grad-accum-steps 8 \
+  --learning-rate 1e-5 \
+  --save-every-steps 100 \
+  --log-every-steps 10
+```
+
+By default the trainer freezes the codec, text encoder, vision encoder, rankers,
+and span predictor, and fine-tunes the flow transformer plus the small prompt
+conditioning adapters. Use `--train-all` only for a deliberately larger
+fine-tuning run.
